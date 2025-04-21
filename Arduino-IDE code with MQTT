@@ -1,0 +1,219 @@
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <DHT.h>
+
+// LCD Configuration
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+// Wi-Fi Configuration
+const char* WIFI_SSID = "RAM";
+const char* WIFI_PASSWORD = "12345678";
+
+// MQTT Broker Details
+const char* MQTT_BROKER = "192.168.200.73";
+const int MQTT_PORT = 1883;
+const char* TOPIC_TEMP = "sensor/temperature";
+const char* TOPIC_HUMIDITY = "sensor/humidity";
+const char* TOPIC_SOIL_MOISTURE = "sensor/soilMoisture";
+const char* TOPIC_LDR = "sensor/ldr"; 
+const char* TOPIC_RELAY_CONTROL = "relay/control";
+
+// DHT11 Configuration
+#define DHTPIN 4
+#define DHTTYPE DHT11
+DHT dht(DHTPIN, DHTTYPE);
+
+bool priorityFlagBulb = false;
+bool priorityFlagFan = false;
+bool priorityFlagPump = false;
+
+
+
+// Sensor Pins
+#define SOIL_MOISTURE_PIN 34
+#define LDR_PIN 36
+
+// Relay Pins
+#define RELAY_BULB 16
+#define RELAY_FAN 18
+#define RELAY_PUMP 17
+
+// WiFi and MQTT clients
+WiFiClient espClient;
+PubSubClient mqttClient(espClient);
+
+void connectToWiFi() {
+  Serial.print("Connecting to Wi-Fi");
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nWi-Fi Connected. IP Address: " + WiFi.localIP().toString());
+}
+
+void connectToMQTT() {
+  Serial.print("Connecting to MQTT broker...");
+  while (!mqttClient.connected()) {
+    String clientId = "ESP32Client-" + String(random(0xffff), HEX);
+    if (mqttClient.connect(clientId.c_str())) {
+      Serial.println("Connected to MQTT broker");
+      mqttClient.subscribe(TOPIC_RELAY_CONTROL);
+    } else {
+      Serial.print("Failed to connect. MQTT state: ");
+      Serial.println(mqttClient.state());
+      delay(2000);
+    }
+  }
+}
+
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  String message;
+  for (int i = 0; i < length; i++) {
+    message += (char)payload[i];
+  }
+  Serial.printf("Topic: %s | Message: %s\n", topic, message.c_str());
+  
+  if (String(topic) == TOPIC_RELAY_CONTROL) {
+    if (message == "bulb_on"){
+    priorityFlagBulb = true;  
+    digitalWrite(RELAY_BULB, LOW);
+    } 
+    else if (message == "bulb_off")
+    {
+      priorityFlagBulb = false;
+    digitalWrite(RELAY_BULB, HIGH);
+    } 
+    else if (message == "fan_on"){
+      priorityFlagFan = true;
+    digitalWrite(RELAY_FAN, LOW);
+    } 
+    else if (message == "fan_off"){
+      priorityFlagFan = false;
+    digitalWrite(RELAY_FAN, HIGH);
+    } 
+    else if (message == "pump_on"){
+      priorityFlagPump = true;
+    digitalWrite(RELAY_PUMP, LOW);
+    } 
+    else if (message == "pump_off"){
+      priorityFlagPump = false;
+    digitalWrite(RELAY_PUMP, HIGH);
+    } 
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  
+  // Initialize LCD
+  lcd.init();
+  lcd.backlight();
+  lcd.setCursor(0, 0);
+  lcd.print("Welcome...");
+  
+  // Initialize Sensors
+  dht.begin();
+  pinMode(SOIL_MOISTURE_PIN, INPUT);
+  pinMode(LDR_PIN, INPUT);
+  
+  // Initialize Relays
+  pinMode(RELAY_BULB, OUTPUT);
+  pinMode(RELAY_FAN, OUTPUT);
+  pinMode(RELAY_PUMP, OUTPUT);
+  digitalWrite(RELAY_BULB, HIGH);
+  digitalWrite(RELAY_FAN, HIGH);
+  digitalWrite(RELAY_PUMP, HIGH);
+  
+  // Connect to Wi-Fi and MQTT
+  connectToWiFi();
+  mqttClient.setServer(MQTT_BROKER, MQTT_PORT);
+  mqttClient.setCallback(mqttCallback);
+  connectToMQTT();
+  
+  // Display "Ready" message
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("System Ready");
+  delay(2000);
+}
+
+void loop() {
+  if (!mqttClient.connected()) connectToMQTT();
+  mqttClient.loop();
+
+  float temperature = dht.readTemperature();
+  float humidity = dht.readHumidity();
+  int soilMoisture = analogRead(SOIL_MOISTURE_PIN);
+  int ldrValue = analogRead(LDR_PIN);
+
+  if (!isnan(temperature) && !isnan(humidity)) {
+    char payload[20];
+    snprintf(payload, sizeof(payload), "%.2f", temperature);
+    mqttClient.publish(TOPIC_TEMP, payload);
+    snprintf(payload, sizeof(payload), "%.2f", humidity);
+    mqttClient.publish(TOPIC_HUMIDITY, payload);
+    Serial.printf("Temp: %.2f C, Hum: %.2f%%\n", temperature, humidity);
+  } else {
+    Serial.println("Failed to read from DHT sensor");
+  }
+  
+
+  char soilPayload[20], ldrPayload[20];
+  snprintf(soilPayload, sizeof(soilPayload), "%d", soilMoisture);
+  mqttClient.publish(TOPIC_SOIL_MOISTURE, soilPayload);
+  Serial.printf("Soil Moisture: %d\n", soilMoisture);
+
+  snprintf(ldrPayload, sizeof(ldrPayload), "%d", ldrValue);
+  mqttClient.publish(TOPIC_LDR, ldrPayload);
+  Serial.printf("LDR Value: %d\n", ldrValue);
+
+  if (temperature > 30) {
+    if(!priorityFlagFan){
+    digitalWrite(RELAY_FAN, LOW);
+    Serial.println("Fan turned ON due to high temperature");
+    }
+  } else if (temperature < 28) {
+    if(!priorityFlagFan){
+    digitalWrite(RELAY_FAN, HIGH);
+    Serial.println("Fan turned OFF as temperature is normal");
+    }
+  }
+
+  if (soilMoisture < 3000 ) {
+    if(!priorityFlagPump){
+    digitalWrite(RELAY_PUMP, HIGH);
+    Serial.println("Pump turned OFF as soil moisture is sufficient");
+    }
+  } else {
+    if(!priorityFlagPump){
+    digitalWrite(RELAY_PUMP, LOW);
+    Serial.println("Pump turned ON due to dry soil");
+    }
+  }
+
+  if (ldrValue < 2200) {
+    if(!priorityFlagBulb){
+    digitalWrite(RELAY_BULB, LOW);
+    Serial.println("Bulb turned ON due to low light");
+    }
+  } else if (ldrValue > 2200) {
+    if(!priorityFlagBulb){
+    digitalWrite(RELAY_BULB, HIGH);
+    Serial.println("Bulb turned OFF due to sufficient light");
+    }
+  }
+
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("T:"); lcd.print(temperature, 1); lcd.print("C ");
+  lcd.print("H:"); lcd.print(humidity, 1); lcd.print( "%");
+
+  lcd.setCursor(0, 1);
+  lcd.print("S:"); lcd.print(soilMoisture);
+  lcd.print(" L:"); lcd.print(ldrValue);
+
+  delay(2000);
+}
